@@ -1,0 +1,127 @@
+name: Build and Deploy AKS, ACR and application image
+on: 
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: Deployment Environment
+        default: prod
+        required: true
+
+env:
+  RESOURCEGROUPNAME: "demo-saas-aks"
+  LOCATION: "West Europe"
+  LOCATION-RG: "westeurope"
+  SUBSCRIPTIONID: "a1815f50-2e0b-4ea4-a4c3-7bdb35bdea92"
+  IMAGENAME: "demo-saas-aks-3467"
+  REGISTRYSKU: "Standard"
+  REGISTRYNAME: "demosaasaksacr"
+  REGISTRYLOCATION: "West Europe"
+  CLUSTERNAME: "demo-saas-aks"
+  APPINSIGHTSLOCATION: "West Europe"
+  CLUSTERLOCATION: "West Europe"
+  AGENTCOUNT: "1"
+  AGENTVMSIZE: "Standard_B4ms"
+  KUBERNETESVERSION: 1.25.4
+  OMSLOCATION: "West Europe"
+  OMSWORKSPACENAME: "demo-saas-aks-2116"
+  HTTPSAPPLICATIONROUTINGENABLED: false
+  KUBERNETESAPI: "apps/v1"
+  NAMESPACE: "demo-saas-aks-52c7"
+
+jobs:
+  build:
+    name: Build and Deploy AKS, ACR and build/push image to container registry
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v2
+
+    # login to azure
+    - name: Login to Azure
+      uses: azure/login@v1
+      with:
+        creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+    - name: Create resource group
+      uses: Azure/CLI@v1
+      with:
+        inlineScript: |
+          #!/bin/bash
+          if $(az group exists --name ${{ env.RESOURCEGROUPNAME }}) ; then
+            echo "Azure resource group already exists, skipping creation..."
+          else
+            az group create --name ${{ env.RESOURCEGROUPNAME }} --location ${{ env.LOCATION-RG }}
+            echo "Azure resource group created"
+          fi 
+
+    - name: Create AKS Cluster
+      uses: azure/arm-deploy@v1
+      id: deploy
+      with:
+        scope: resourcegroup
+        subscriptionId: ${{ env.SUBSCRIPTIONID }}
+        resourceGroupName: ${{ env.RESOURCEGROUPNAME }}
+        template: ./ArmTemplates/aks-template.json
+        parameters: clusterName="${{ env.CLUSTERNAME }}" appInsightsLocation="${{ env.APPINSIGHTSLOCATION }}" clusterLocation="${{ env.CLUSTERLOCATION }}" agentCount="${{ env.AGENTCOUNT }}" agentVMSize="${{ env.AGENTVMSIZE }}" kubernetesVersion="${{ env.KUBERNETESVERSION }}" omsLocation="${{ env.OMSLOCATION }}" omsWorkspaceName="${{ env.OMSWORKSPACENAME }}" httpApplicationRoutingEnabled="${{ env.HTTPSAPPLICATIONROUTINGENABLED }}"  dnsPrefix="${{ env.CLUSTERNAME }}"
+
+    - name: Get AKS Credentials
+      id: getContext
+      run: |
+          az aks get-credentials --resource-group ${{ env.RESOURCEGROUPNAME }} --name ${{ env.CLUSTERNAME }} --file $GITHUB_WORKSPACE/kubeconfig
+          echo "KUBECONFIG=$GITHUB_WORKSPACE/kubeconfig" >> $GITHUB_ENV
+
+    - name: Enable Microsoft Defender for Containers 
+      id: enableDefenderForContainers
+      run: |
+          az aks update --enable-defender --resource-group ${{ env.RESOURCEGROUPNAME }} --name ${{ env.CLUSTERNAME }}
+
+    - name: Enable Open Service Mesh 
+      id: enableOSM
+      run: |
+          az aks enable-addons -g ${{ env.RESOURCEGROUPNAME }} -n ${{ env.CLUSTERNAME }} --addons open-service-mesh
+          echo `az aks show -g ${{ env.RESOURCEGROUPNAME }} -n ${{ env.CLUSTERNAME }}  --query 'addonProfiles.openServiceMesh.enabled'`
+          echo `kubectl get deployment -n kube-system osm-controller -o=jsonpath='{$.spec.template.spec.containers[:1].image}'`
+
+    - name: Create Azure Key Vault 
+      # if: ${{ false }}
+      id: createKeyvault
+      run: |
+          az keyvault create -g ${{ env.RESOURCEGROUPNAME }} -n ${{ env.CLUSTERNAME }} -l ${{ env.LOCATION-RG }}
+          az keyvault secret set --vault-name ${{ env.CLUSTERNAME }} -n ExampleSecret --value MyAKSExampleSecret
+ 
+    - name: Enable Azure Key Vault Provider for Secrets Store CSI Driver
+      # if: ${{ false }}
+      id: enableKeyvaultCSI
+      run: |
+          az aks enable-addons --addons azure-keyvault-secrets-provider -g ${{ env.RESOURCEGROUPNAME }} -n ${{ env.CLUSTERNAME }}
+          echo `kubectl get pods -n kube-system -l 'app in (secrets-store-csi-driver,secrets-store-provider-azure)'`
+       
+    - name: Use the CSI Secret Store addon user-assigned managed identity
+      if: ${{ false }}
+      id: useCSIaddon
+      run: |
+          echo "clientId=$(az aks show -g ${{ env.RESOURCEGROUPNAME }} -n ${{ env.CLUSTERNAME }} --query addonProfiles.azureKeyvaultSecretsProvider.identity.clientId -o tsv)" >> $GITHUB_ENV
+          az keyvault set-policy -n ${{ env.CLUSTERNAME }} --key-permissions get --spn ${{ env.clientId }}
+          az keyvault set-policy -n ${{ env.CLUSTERNAME }} --secret-permissions get --spn ${{ env.clientId }}
+          az keyvault set-policy -n ${{ env.CLUSTERNAME }} --certificate-permissions get --spn ${{ env.clientId }}
+          kubectl apply -f ./k8s/secretproviderclass.yaml
+          kubectl apply -f ./k8s/podusingcsisecret.yaml
+          echo `kubectl get pods -n kube-system -l 'app in (secrets-store-csi-driver,secrets-store-provider-azure)'`
+         
+    - name: Create ACR
+      id: createACR
+      run: |
+          az acr create -n ${{ env.REGISTRYNAME }} -g ${{ env.RESOURCEGROUPNAME }} --location "${{env.REGISTRYLOCATION}}" --sku ${{env.REGISTRYSKU}} --admin-enabled
+          echo "acr_username=$(az acr credential show -n ${{ env.REGISTRYNAME }} --query username)"  >> $GITHUB_OUTPUT
+          echo "acr_password=$(az acr credential show -n ${{ env.REGISTRYNAME }} --query passwords[0].value)"  >> $GITHUB_OUTPUT
+          echo "::add-mask::`az acr credential show -n ${{ env.REGISTRYNAME }} --query passwords[0].value`"
+
+    - name: Build and push image to ACR
+      id: build-image
+      run: |
+        echo "::add-mask::${{ steps.createACR.outputs.acr_password }}"
+        docker login ${{ env.REGISTRYNAME }}.azurecr.io --username ${{ steps.createACR.outputs.acr_username }} --password ${{ steps.createACR.outputs.acr_password }}
+        docker build "$GITHUB_WORKSPACE/Application" -f  "Application/Dockerfile" -t ${{ env.REGISTRYNAME }}.azurecr.io/${{ env.IMAGENAME }}:${{ github.sha }}
+        docker tag ${{ env.REGISTRYNAME }}.azurecr.io/${{ env.IMAGENAME }}:${{ github.sha }} ${{ env.REGISTRYNAME }}.azurecr.io/${{ env.IMAGENAME }}:latest
+        docker push ${{ env.REGISTRYNAME }}.azurecr.io/${{ env.IMAGENAME }}:${{ github.sha }}
+        docker push ${{ env.REGISTRYNAME }}.azurecr.io/${{ env.IMAGENAME }}:latest
+ 

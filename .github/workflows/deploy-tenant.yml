@@ -1,0 +1,116 @@
+name: Deploy application to AKS
+on: 
+  workflow_dispatch:
+    inputs:
+      tenant:
+        description: Add new tenant
+        default: Customer Name
+        required: true
+      imagetag:
+        description: App container image tag to deploy
+        default: latest
+        required: true
+
+env:
+  RESOURCEGROUPNAME: "demo-saas-aks"
+  LOCATION: "West Europe"
+  SUBSCRIPTIONID: "a1815f50-2e0b-4ea4-a4c3-7bdb35bdea92"
+  IMAGENAME: "demo-saas-aks-3467"
+  REGISTRYSKU: "Standard"
+  REGISTRYNAME: "demosaasaksacr"
+  REGISTRYLOCATION: "West Europe"
+  CLUSTERNAME: "demo-saas-aks"
+  APPINSIGHTSLOCATION: "West Europe"
+  CLUSTERLOCATION: "West Europe"
+  AGENTCOUNT: "1"
+  AGENTVMSIZE: "Standard_B2ms"
+  KUBERNETESVERSION: 1.25.4
+  OMSLOCATION: "West Europe"
+  OMSWORKSPACENAME: "demo-saas-aks-2116"
+  HTTPSAPPLICATIONROUTINGENABLED: false
+  KUBERNETESAPI: "apps/v1"
+  NAMESPACE: "demo-saas-aks-52c7"
+
+jobs:
+  deploy:
+    name: Deploy application to AKS
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v2
+
+    # login to azure
+    - name: Login to Azure
+      uses: azure/login@v1
+      with:
+        creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+    - name: Get AKS Credentials
+      id: getContext
+      run: |
+          az aks get-credentials --resource-group ${{ env.RESOURCEGROUPNAME }} --name ${{ env.CLUSTERNAME }} --file $GITHUB_WORKSPACE/kubeconfig
+          echo "KUBECONFIG=$GITHUB_WORKSPACE/kubeconfig" >> $GITHUB_ENV
+
+    - name: Create namespace
+      run: |
+        namespacePresent=`kubectl get namespace | grep ${{ github.event.inputs.tenant }} | wc -l`
+        if [ $namespacePresent -eq 0 ]
+        then
+            echo `kubectl create namespace ${{ github.event.inputs.tenant }}`
+        fi
+
+    - name: Apply Resource Quota for tenant
+      run: |
+        kubectl apply -f ./k8s/resourcequota.yaml --namespace ${{ github.event.inputs.tenant }}
+        echo `kubectl get resourcequotas -n ${{ github.event.inputs.tenant }}`
+        
+
+    - name: Get ACR credentials
+      id: getACRCred
+      run: |
+           echo "acr_username=$(az acr credential show -n ${{ env.REGISTRYNAME }} --query username | xargs)"  >> $GITHUB_OUTPUT
+           echo "acr_password=$(az acr credential show -n ${{ env.REGISTRYNAME }} --query passwords[0].value | xargs)"  >> $GITHUB_OUTPUT
+           echo "::add-mask::`az acr credential show -n ${{ env.REGISTRYNAME }} --query passwords[0].value | xargs`"
+
+    - uses: azure/k8s-create-secret@v1
+      with:
+        namespace: ${{ github.event.inputs.tenant }}
+        container-registry-url: ${{ env.REGISTRYNAME }}.azurecr.io
+        container-registry-username: ${{ steps.getACRCred.outputs.acr_username }}
+        container-registry-password: ${{ steps.getACRCred.outputs.acr_password }}
+        secret-name: ${{ env.CLUSTERNAME }}dockerauth
+
+    - name: Fetch Application insights key
+      id: GetAppInsightsKey
+      run: |
+        echo "AIKey=$(az resource show -g ${{ env.RESOURCEGROUPNAME }} -n ${{ env.CLUSTERNAME }} --resource-type "Microsoft.Insights/components" --query "properties.InstrumentationKey" -o tsv)"  >> $GITHUB_OUTPUT
+        echo "::add-mask::`az resource show -g ${{ env.RESOURCEGROUPNAME }} -n ${{ env.CLUSTERNAME }} --resource-type "Microsoft.Insights/components" --query "properties.InstrumentationKey" -o tsv`"
+
+    - uses: azure/k8s-bake@v1
+      id: bakeManifests
+      with:
+        renderEngine: 'helm'
+        helmChart: './Application/charts/sampleapp' 
+        overrideFiles: './Application/charts/sampleapp/values.yaml'
+        overrides: |
+            image.repository:${{ env.REGISTRYNAME }}.azurecr.io/${{ env.IMAGENAME }}
+            image.tag:${{ github.event.inputs.imagetag }}
+            imagePullSecrets:{${{ env.CLUSTERNAME }}dockerauth}
+            applicationInsights.InstrumentationKey:${{ steps.GetAppInsightsKey.outputs.AIKey }}
+            apiVersion:${{ env.KUBERNETESAPI }}
+            extensionApiVersion:${{ env.KUBERNETESAPI }}
+        helm-version: 'latest' 
+        silent: 'true'
+
+    - uses: azure/k8s-deploy@v1
+      with:
+        namespace: ${{ github.event.inputs.tenant }}
+        manifests: ${{ steps.bakeManifests.outputs.manifestsBundle }}
+        images: |
+          ${{ env.REGISTRYNAME }}.azurecr.io/${{ env.IMAGENAME }}:${{ github.event.inputs.imagetag }}
+        imagepullsecrets: |
+          ${{ env.CLUSTERNAME }}dockerauth
+          
+    - name : Cleanup
+      run: | 
+        az logout
+        rm -rf $GITHUB_WORKSPACE/kubeconfig
