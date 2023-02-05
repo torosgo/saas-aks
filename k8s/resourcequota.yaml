@@ -1,0 +1,9 @@
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: prod-app
+spec:
+  hard:
+    cpu: 2000m
+    memory: 2048Mi
+    pods: "20"

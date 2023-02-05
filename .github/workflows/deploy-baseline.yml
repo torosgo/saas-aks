@@ -1,0 +1,161 @@
+name: Deploy baseline
+on: 
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: Deployment Environment
+        default: prod
+        required: true
+      aks:
+        description: set 'yes' to activate aks step, else deactivates
+        default: "yes"
+        required: true
+      defender:
+        description: set 'yes' to activate defender step, else deactivates
+        default: "yes"
+        required: true
+      osm:
+        description: set 'yes' to activate open service mesh step, else deactivates
+        default: "yes"
+        required: true
+      keyvault:
+        description: set 'yes' to activate keyvault step, else deactivates
+        default: "yes"
+        required: true
+      csikeyvaultenable:
+        description: set 'yes' to activate csi keyvault enable step, else deactivates
+        default: "yes"
+        required: true
+      acr:
+        description: set 'yes' to activate acr step, else deactivates
+        default: "yes"
+        required: true
+      acrcreds:
+        description: set 'yes' to activate acrcreds step, else deactivates
+        default: "yes"
+        required: true
+      image:
+        description: set 'yes' to activate build image step, else deactivates
+        default: "yes"
+        required: true
+      testid:
+        description: set 'yes' to activate test step, else deactivates
+        default: "yes"
+        required: true
+
+env:
+  RESOURCEGROUPNAME: "demo-saas-aks"
+  LOCATION: "West Europe"
+  LOCATION-RG: "westeurope"
+  IMAGENAME: "demo-saas-aks-3467"
+  REGISTRYSKU: "Standard"
+  REGISTRYNAME: "demosaasaksacr"
+  REGISTRYLOCATION: "West Europe"
+  CLUSTERNAME: "demo-saas-aks"
+  APPINSIGHTSLOCATION: "West Europe"
+  CLUSTERLOCATION: "West Europe"
+  AGENTCOUNT: "1"
+  AGENTVMSIZE: "Standard_B4ms"
+  KUBERNETESVERSION: 1.25.4
+  OMSLOCATION: "West Europe"
+  OMSWORKSPACENAME: "demo-saas-aks-2116"
+  HTTPSAPPLICATIONROUTINGENABLED: false
+  KUBERNETESAPI: "apps/v1"
+  NAMESPACE: "demo-saas-aks-52c7"
+
+jobs:
+  build:
+    name: Deploy baseline
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v2
+
+    # login to azure
+    - name: Login to Azure
+      uses: azure/login@v1
+      with:
+        creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+    - name: Create resource group
+      uses: Azure/CLI@v1
+      with:
+        inlineScript: |
+          #!/bin/bash
+          if $(az group exists --name ${{ env.RESOURCEGROUPNAME }}) ; then
+            echo "Azure resource group already exists, skipping creation..."
+          else
+            az group create --name ${{ env.RESOURCEGROUPNAME }} --location ${{ env.LOCATION-RG }}
+            echo "Azure resource group created"
+          fi 
+
+    - name: Create AKS Cluster
+      if: "${{ github.event.inputs.aks == 'yes' }}"
+      uses: azure/arm-deploy@v1
+      id: deploy
+      with:
+        scope: resourcegroup
+        subscriptionId: ${{ secrets.SUBSCRIPTIONID }}
+        resourceGroupName: ${{ env.RESOURCEGROUPNAME }}
+        template: ./ArmTemplates/aks-template.json
+        parameters: clusterName="${{ env.CLUSTERNAME }}" appInsightsLocation="${{ env.APPINSIGHTSLOCATION }}" clusterLocation="${{ env.CLUSTERLOCATION }}" agentCount="${{ env.AGENTCOUNT }}" agentVMSize="${{ env.AGENTVMSIZE }}" kubernetesVersion="${{ env.KUBERNETESVERSION }}" omsLocation="${{ env.OMSLOCATION }}" omsWorkspaceName="${{ env.OMSWORKSPACENAME }}" httpApplicationRoutingEnabled="${{ env.HTTPSAPPLICATIONROUTINGENABLED }}"  dnsPrefix="${{ env.CLUSTERNAME }}"
+
+    - name: Get AKS Credentials
+      id: getContext
+      run: |
+          az aks get-credentials --resource-group ${{ env.RESOURCEGROUPNAME }} --name ${{ env.CLUSTERNAME }} --file $GITHUB_WORKSPACE/kubeconfig
+          echo "KUBECONFIG=$GITHUB_WORKSPACE/kubeconfig" >> $GITHUB_ENV
+
+    - name: Enable Microsoft Defender for Containers
+      if: "${{ github.event.inputs.defender == 'yes' }}" 
+      id: enableDefenderForContainers
+      run: |
+          az aks update --enable-defender --resource-group ${{ env.RESOURCEGROUPNAME }} --name ${{ env.CLUSTERNAME }}
+
+    - name: Enable Open Service Mesh 
+      if: "${{ github.event.inputs.osm == 'yes' }}"
+      id: enableOSM
+      run: |
+          az aks enable-addons -g ${{ env.RESOURCEGROUPNAME }} -n ${{ env.CLUSTERNAME }} --addons open-service-mesh
+          echo `az aks show -g ${{ env.RESOURCEGROUPNAME }} -n ${{ env.CLUSTERNAME }}  --query 'addonProfiles.openServiceMesh.enabled'`
+          echo `kubectl get deployment -n kube-system osm-controller -o=jsonpath='{$.spec.template.spec.containers[:1].image}'`
+
+    - name: Create Azure Key Vault 
+      # if: ${{ false }}
+      if: "${{ github.event.inputs.keyvault == 'yes' }}"
+      id: createKeyvault
+      run: |
+          az keyvault create -g ${{ env.RESOURCEGROUPNAME }} -n ${{ env.CLUSTERNAME }} -l ${{ env.LOCATION-RG }}
+          az keyvault secret set --vault-name ${{ env.CLUSTERNAME }} -n ExampleSecret --value MyAKSExampleSecret
+ 
+    - name: Enable Azure Key Vault Provider for Secrets Store CSI Driver
+      # if: ${{ false }}
+      if: "${{ github.event.inputs.csikeyvaultenable == 'yes' }}"
+      id: enableKeyvaultCSI
+      run: |
+          az aks enable-addons --addons azure-keyvault-secrets-provider -g ${{ env.RESOURCEGROUPNAME }} -n ${{ env.CLUSTERNAME }}
+          echo `kubectl get pods -n kube-system -l 'app in (secrets-store-csi-driver,secrets-store-provider-azure)'`
+     
+    - name: Create ACR
+      if: "${{ github.event.inputs.acr == 'yes' }}"
+      id: createACR
+      run: |
+          az acr create -n ${{ env.REGISTRYNAME }} -g ${{ env.RESOURCEGROUPNAME }} --location "${{env.REGISTRYLOCATION}}" --sku ${{env.REGISTRYSKU}} --admin-enabled
+
+    - name: Get ACR credentials
+      if: "${{ github.event.inputs.acrcreds == 'yes' }}"
+      id: getACRCred
+      run: |
+           echo "acr_username=$(az acr credential show -n ${{ env.REGISTRYNAME }} --query username | xargs)"  >> $GITHUB_OUTPUT
+           echo "acr_password=$(az acr credential show -n ${{ env.REGISTRYNAME }} --query passwords[0].value | xargs)"  >> $GITHUB_OUTPUT
+           echo "::add-mask::`az acr credential show -n ${{ env.REGISTRYNAME }} --query passwords[0].value | xargs`"
+
+    - name: Build and push image to ACR
+      if: "${{ github.event.inputs.image == 'yes' }}"
+      id: build-image
+      run: |
+        echo "::add-mask::${{ steps.getACRCred.outputs.acr_password }}"
+        docker login ${{ env.REGISTRYNAME }}.azurecr.io --username ${{ steps.getACRCred.outputs.acr_username }} --password ${{ steps.getACRCred.outputs.acr_password }}
+        docker build "$GITHUB_WORKSPACE/Application" -f  "Application/Dockerfile" -t ${{ env.REGISTRYNAME }}.azurecr.io/${{ env.IMAGENAME }}:${{ github.sha }}
+        docker tag ${{ env.REGISTRYNAME }}.azurecr.io/${{ env.IMAGENAME }}:${{ github.sha }} ${{ env.REGISTRYNAME }}.azurecr.io/${{ env.IMAGENAME }}:latest
+        docker push ${{ env.REGISTRYNAME }}.azurecr.io/${{ env.IMAGENAME }}:${{ github.sha }}
+        docker push ${{ env.REGISTRYNAME }}.azurecr.io/${{ env.IMAGENAME }}:latest

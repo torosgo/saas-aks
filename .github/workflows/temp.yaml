@@ -1,0 +1,32 @@
+name: Temp workflow
+on: 
+  workflow_dispatch:
+    inputs:
+      condition:
+        description: set 'yes' to activate step, else to deactivate
+        default: yes
+        required: true
+
+env:
+  RESOURCEGROUPNAME: "demo-saas-aks"
+  CLUSTERNAME: "demo-saas-aks"
+
+jobs:
+  temp:
+    name: Temp Job
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v2
+
+    - name: Create namespace
+      if: "${{ false }}"
+      run: |
+        sleep 1
+ 
+    - name: if condition and variable set get
+      if: "${{ github.event.inputs.condition == 'yes' }}"
+      id: varsetget
+      run: |
+          clientId=$(pwd)
+          echo $clientId
+

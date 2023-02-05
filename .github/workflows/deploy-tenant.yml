@@ -1,0 +1,138 @@
+name: Deploy tenant
+on: 
+  workflow_dispatch:
+    inputs:
+      tenant:
+        description: Add new tenant
+        default: Tenant name. Use lowercase alphanumeric characters az09
+        required: true
+      imagetag:
+        description: App container image tag to deploy
+        default: latest
+        required: true
+      quota:
+        description: set 'yes' to activate quota step, else deactivates
+        default: "yes"
+        required: true
+      netpol:
+        description: set 'yes' to activate netpol step, else deactivates
+        default: "yes"
+        required: true
+      csikeyvaultuse:
+        description: set 'yes' to activate csi keyvault use step, else deactivates
+        default: "yes"
+        required: true
+
+env:
+  RESOURCEGROUPNAME: "demo-saas-aks"
+  IMAGENAME: "demo-saas-aks-3467"
+  REGISTRYNAME: "demosaasaksacr"
+  CLUSTERNAME: "demo-saas-aks"
+  KUBERNETESAPI: "apps/v1"
+  NAMESPACE: "demo-saas-aks-52c7"
+
+jobs:
+  deploy:
+    name: Deploy tenant
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v2
+
+    # login to azure
+    - name: Login to Azure
+      uses: azure/login@v1
+      with:
+        creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+    - name: Get AKS Credentials
+      id: getContext
+      run: |
+          az aks get-credentials --resource-group ${{ env.RESOURCEGROUPNAME }} --name ${{ env.CLUSTERNAME }} --file $GITHUB_WORKSPACE/kubeconfig
+          echo "KUBECONFIG=$GITHUB_WORKSPACE/kubeconfig" >> $GITHUB_ENV
+
+    - name: Create namespace
+      run: |
+        namespacePresent=`kubectl get namespace | grep ${{ github.event.inputs.tenant }} | wc -l`
+        if [ $namespacePresent -eq 0 ]
+        then
+            echo `kubectl create namespace ${{ github.event.inputs.tenant }}`
+        fi
+
+    - name: Apply Resource Quota for tenant
+      if: "${{ github.event.inputs.quota == 'yes' }}"
+      id: quota
+      run: |
+        kubectl apply -f ./k8s/resourcequota.yaml --namespace ${{ github.event.inputs.tenant }}
+        echo `kubectl get resourcequotas -n ${{ github.event.inputs.tenant }}`
+
+    - name: Apply Network Policy for tenant namespace
+      if: "${{ github.event.inputs.netpol == 'yes' }}"
+      id: netpol
+      run: |
+        sed -e "s/<tenantname>/${{ github.event.inputs.tenant }}/g" ./k8s/netpol.yaml | kubectl apply -f -
+        echo `kubectl get netpol -n ${{ github.event.inputs.tenant }}`
+        
+
+    - name: Get ACR credentials
+      id: getACRCred
+      run: |
+           echo "acr_username=$(az acr credential show -n ${{ env.REGISTRYNAME }} --query username | xargs)"  >> $GITHUB_OUTPUT
+           echo "acr_password=$(az acr credential show -n ${{ env.REGISTRYNAME }} --query passwords[0].value | xargs)"  >> $GITHUB_OUTPUT
+           echo "::add-mask::`az acr credential show -n ${{ env.REGISTRYNAME }} --query passwords[0].value | xargs`"
+
+    - uses: azure/k8s-create-secret@v1
+      with:
+        namespace: ${{ github.event.inputs.tenant }}
+        container-registry-url: ${{ env.REGISTRYNAME }}.azurecr.io
+        container-registry-username: ${{ steps.getACRCred.outputs.acr_username }}
+        container-registry-password: ${{ steps.getACRCred.outputs.acr_password }}
+        secret-name: ${{ env.CLUSTERNAME }}dockerauth
+
+    - name: Fetch Application insights key
+      id: GetAppInsightsKey
+      run: |
+        echo "AIKey=$(az resource show -g ${{ env.RESOURCEGROUPNAME }} -n ${{ env.CLUSTERNAME }} --resource-type "Microsoft.Insights/components" --query "properties.InstrumentationKey" -o tsv)"  >> $GITHUB_OUTPUT
+        echo "::add-mask::`az resource show -g ${{ env.RESOURCEGROUPNAME }} -n ${{ env.CLUSTERNAME }} --resource-type "Microsoft.Insights/components" --query "properties.InstrumentationKey" -o tsv`"
+
+
+    - name: Use the CSI Secret Store addon, create SecretProviderClass and use in a Pod
+      # if: ${{ false }}
+      if: "${{ github.event.inputs.csikeyvaultuse == 'yes' }}"
+      id: useCSIaddon
+      run: |
+          kvobjectId=$(az aks show -g ${{ env.RESOURCEGROUPNAME }} -n ${{ env.CLUSTERNAME }} --query addonProfiles.azureKeyvaultSecretsProvider.identity.objectId -o tsv)
+          tenantId=$(az aks show -g ${{ env.RESOURCEGROUPNAME }} -n ${{ env.CLUSTERNAME }} --query identity.tenantId -o tsv)
+          az keyvault set-policy -n ${{ env.CLUSTERNAME }} --key-permissions get --secret-permissions get --certificate-permissions get --object-id  $kvobjectId
+          sed -e "s/<client-id>/${{ secrets.CLIENTID }}/g" -e "s/<key-vault-name>/${{ env.CLUSTERNAME }}/g" -e "s/<tenant-id>/$tenantId/g"  ./k8s/secretproviderclass.yaml | kubectl apply -n ${{ github.event.inputs.tenant }} -f -
+          kubectl apply -n ${{ github.event.inputs.tenant }} -f ./k8s/podusingcsisecret.yaml
+          echo `kubectl get pods -n kube-system -l 'app in (secrets-store-csi-driver,secrets-store-provider-azure)'`
+    
+    - uses: azure/k8s-bake@v1
+      id: bakeManifests
+      with:
+        renderEngine: 'helm'
+        helmChart: './Application/charts/sampleapp' 
+        overrideFiles: './Application/charts/sampleapp/values.yaml'
+        overrides: |
+            image.repository:${{ env.REGISTRYNAME }}.azurecr.io/${{ env.IMAGENAME }}
+            image.tag:${{ github.event.inputs.imagetag }}
+            imagePullSecrets:{${{ env.CLUSTERNAME }}dockerauth}
+            applicationInsights.InstrumentationKey:${{ steps.GetAppInsightsKey.outputs.AIKey }}
+            apiVersion:${{ env.KUBERNETESAPI }}
+            extensionApiVersion:${{ env.KUBERNETESAPI }}
+        helm-version: 'latest' 
+        silent: 'true'
+
+    - uses: azure/k8s-deploy@v1
+      with:
+        namespace: ${{ github.event.inputs.tenant }}
+        manifests: ${{ steps.bakeManifests.outputs.manifestsBundle }}
+        images: |
+          ${{ env.REGISTRYNAME }}.azurecr.io/${{ env.IMAGENAME }}:${{ github.event.inputs.imagetag }}
+        imagepullsecrets: |
+          ${{ env.CLUSTERNAME }}dockerauth
+          
+    - name : Cleanup
+      run: | 
+        az logout
+        rm -rf $GITHUB_WORKSPACE/kubeconfig
