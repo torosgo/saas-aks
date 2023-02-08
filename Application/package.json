@@ -19,7 +19,7 @@
     "pug": "^2.0.0-beta6",
     "serve-favicon": "^2.3.0",
     "ioredis": "^3.2.2",
-    "nodemon": "~1.17.3"
+    "nodemon": "~2.0.20"
   },
   "engines": {
     "node": "~6.10.x"
